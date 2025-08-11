@@ -1,43 +1,127 @@
-name: Dependency-Track Integration (Java)
+name: SBOM Scan and Upload
 
 on:
   push:
-    branches: [ master ]
+    branches: ['**']
+  pull_request:
+    branches: ['**']
+  workflow_dispatch:
 
 jobs:
-  sbom-upload:
+  sbom:
     runs-on: ubuntu-latest
+    env:
+      DT_URL: ${{ secrets.DEPENDENCY_TRACK_API_URL }}       # e.g., https://dependency-track.example.com
+      DT_API_KEY: ${{ secrets.DEPENDENCY_TRACK_API_KEY }}
+      PROJECT_NAME: ${{ github.repository }}
+      PROJECT_VERSION: ${{ github.sha }}
 
     steps:
-    - name: Checkout Code
-      uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-    - name: Set up JDK
-      uses: actions/setup-java@v3
-      with:
-        distribution: 'temurin'
-        java-version: '17'  # Change to 11 or 21 as per your project
+      - name: Install Syft
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+          | sh -s -- -b /usr/local/bin
 
-    - name: Build Java App
-      run: mvn clean package --batch-mode
+      # Java / Spring (Maven)
+      - name: Generate SBOM - Java Maven
+        if: hashFiles('pom.xml') != ''
+        run: |
+          mvn -B clean install -DskipTests
+          syft target/*.jar -o cyclonedx-json > sbom.json
 
-    - name: Generate SBOM using Syft
-      uses: anchore/sbom-action@v0.15.6
-      with:
-        format: cyclonedx
-        output-file: sbom.xml
-        path: target/
-        upload-artifact: false
+      # Gradle / Kotlin
+      - name: Generate SBOM - Gradle
+        if: hashFiles('build.gradle*') != ''
+        run: |
+          ./gradlew build -x test
+          syft build/libs/*.jar -o cyclonedx-json > sbom.json
 
-    - name: Upload SBOM to Dependency-Track
-      env:
-        API_KEY: ${{ secrets.DEPENDENCY_TRACK_API_KEY }}
-        DT_URL: ${{ secrets.DEPENDENCY_TRACK_API_URL }}
-        PROJECT_UUID: ${{ secrets.DEPENDENCY_TRACK_PROJECT_UUID }}
-      run: |
-        echo "Uploading SBOM to Dependency-Track"
-        curl -X "POST" "$DT_URL/api/v1/bom" \
-             -H "X-Api-Key: $API_KEY" \
-             -H "Content-Type: multipart/form-data" \
-             -F "project=$PROJECT_UUID" \
-             -F "bom=@sbom.xml"
+      # Node.js / React
+      - name: Generate SBOM - Node.js
+        if: hashFiles('package-lock.json') != '' || hashFiles('yarn.lock') != ''
+        run: |
+          syft . -o cyclonedx-json > sbom.json
+
+      # Python
+      - name: Generate SBOM - Python
+        if: hashFiles('requirements.txt') != '' || hashFiles('poetry.lock') != ''
+        run: |
+          syft . -o cyclonedx-json > sbom.json
+
+      # Flutter
+      - name: Generate SBOM - Flutter
+        if: hashFiles('pubspec.lock') != ''
+        run: |
+          syft . -o cyclonedx-json > sbom.json
+
+      # Create project in Dependency-Track if missing
+      - name: Get or Create Project
+        id: project
+        run: |
+          UUID=$(curl -s -H "X-Api-Key: $DT_API_KEY" \
+            "$DT_URL/api/v1/project?name=$PROJECT_NAME" | jq -r '.[0].uuid // empty')
+
+          if [ -z "$UUID" ]; then
+            echo "Creating new project..."
+            UUID=$(curl -s -X PUT -H "Content-Type: application/json" \
+              -H "X-Api-Key: $DT_API_KEY" \
+              -d '{"name":"'"$PROJECT_NAME"'","version":"'"$PROJECT_VERSION"'"}' \
+              "$DT_URL/api/v1/project" | jq -r '.uuid')
+          fi
+
+          echo "uuid=$UUID" >> $GITHUB_OUTPUT
+
+      # Upload SBOM
+      - name: Upload SBOM to Dependency-Track
+        run: |
+          curl -s -X POST "$DT_URL/api/v1/bom" \
+            -H "X-Api-Key: $DT_API_KEY" \
+            -F "project=${{ steps.project.outputs.uuid }}" \
+            -F "bom=@sbom.json"
+
+
+# name: Dependency-Track Integration (Java)
+
+# on:
+#   push:
+#     branches: [ master ]
+
+# jobs:
+#   sbom-upload:
+#     runs-on: ubuntu-latest
+
+#     steps:
+#     - name: Checkout Code
+#       uses: actions/checkout@v4
+
+#     - name: Set up JDK
+#       uses: actions/setup-java@v3
+#       with:
+#         distribution: 'temurin'
+#         java-version: '17'  # Change to 11 or 21 as per your project
+
+#     - name: Build Java App
+#       run: mvn clean package --batch-mode
+
+#     - name: Generate SBOM using Syft
+#       uses: anchore/sbom-action@v0.15.6
+#       with:
+#         format: cyclonedx
+#         output-file: sbom.xml
+#         path: target/
+#         upload-artifact: false
+
+#     - name: Upload SBOM to Dependency-Track
+#       env:
+#         API_KEY: ${{ secrets.DEPENDENCY_TRACK_API_KEY }}
+#         DT_URL: ${{ secrets.DEPENDENCY_TRACK_API_URL }}
+#         PROJECT_UUID: ${{ secrets.DEPENDENCY_TRACK_PROJECT_UUID }}
+#       run: |
+#         echo "Uploading SBOM to Dependency-Track"
+#         curl -X "POST" "$DT_URL/api/v1/bom" \
+#              -H "X-Api-Key: $API_KEY" \
+#              -H "Content-Type: multipart/form-data" \
+#              -F "project=$PROJECT_UUID" \
+#              -F "bom=@sbom.xml"
